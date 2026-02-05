@@ -1324,21 +1324,25 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
     else:
         log.info("Error folder already exists.")
 
+    source_path = filename
+    base = os.path.basename(source_path)
+    error_path = os.path.join(error_folder, base)
+    backup_path = os.path.join(backup_folder, base)
     log.info("Filename passed in: {filename}".format(filename=filename))
+    log.info("Source path resolved: {sp}".format(sp=source_path))
+    log.info("Backup path resolved: {bp}".format(bp=backup_path))
+    log.info("Error path resolved: {ep}".format(ep=error_path))
     log.info("Checking file....")
-    if os.path.exists(filename):
+    if os.path.exists(source_path):
         log.info("File found, proceeding...")
-        att_name = filename.split(".")
-        att_file_name = att_name[0]
-        att_file_ext = att_name[1]
+        att_file_name, att_file_ext = os.path.splitext(base)
+        att_file_ext = att_file_ext.lstrip(".")
         if att_file_ext == "xls" or att_file_ext == "xlsx":
-            local_path = os.path.join(SCRIPT_PATH, filename)
-            backup_path = os.path.join(backup_folder, filename)
-            log.info("Processing file: {sn}".format(sn=local_path))
+            log.info("Processing file: {sn}".format(sn=source_path))
             log.info("Getting returned data...")
-            returned_data_df = load_excel_file(filename)
+            returned_data_df = load_excel_file(source_path)
             returned_data_df_len = len(returned_data_df)
-            other_statuses_df = load_other_statuses(filename)
+            other_statuses_df = load_other_statuses(source_path)
             other_statuses_df.columns = other_statuses_df.columns.str.strip()
             other_statuses_df_len = len(other_statuses_df)
             log.info("Main data loaded.  Records found: {rf}".format(rf=returned_data_df_len))
@@ -1361,8 +1365,9 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                     ## Kick out the file
                     log.critical("Kicking the file to the error directory...")
                     log.critical("Moving returned file {sn} to error folder...".format(sn=filename))
-                    error_path = os.path.join(error_folder, filename)
-                    os.rename(local_path, error_path)
+                    log.critical("Rename source: {sp}".format(sp=source_path))
+                    log.critical("Rename destination: {dp}".format(dp=error_path))
+                    os.rename(source_path, error_path)
                     log.critical("Report file moved to error folder.")
                     log.critical("Sending teams message...")
                     send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
@@ -1390,9 +1395,11 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                         pend=reference_stats.get("pending", 0),
                     )
                 )
-                if os.path.exists(local_path):
+                if os.path.exists(source_path):
                     log.info("File found, moving to backup.")
-                    os.rename(local_path, backup_path)
+                    log.info("Rename source: {sp}".format(sp=source_path))
+                    log.info("Rename destination: {dp}".format(dp=backup_path))
+                    os.rename(source_path, backup_path)
                 return
 
             log.info(
@@ -1437,12 +1444,14 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                     update_gsd_table(status_name=other_rec["status_name"], office_id=other_rec["office_id"])
 
             log.info("Moving returned file {sn} to backup folder...".format(sn=filename))
-            if os.path.exists(local_path):
+            if os.path.exists(source_path):
                 log.info("File found, moving.")
-                os.rename(local_path, backup_path)
+                log.info("Rename source: {sp}".format(sp=source_path))
+                log.info("Rename destination: {dp}".format(dp=backup_path))
+                os.rename(source_path, backup_path)
                 log.info("Report file moved to backup folder.")
             else:
-                log.error("File not found during backup.  Path: {pa}".format(pa=local_path))
+                log.error("File not found during backup.  Path: {pa}".format(pa=source_path))
     else:
         err = "File not found!"
         log.info(err)
