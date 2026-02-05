@@ -1271,6 +1271,7 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
     backup_folder = SCRIPT_PATH + "backup"
     error_folder = SCRIPT_PATH + "error"
     dryrun_backup_folder = SCRIPT_PATH + "dryrun_backup"
+    downloaded_files = []
 
     ensure_folder_exists(backup_folder, "backup")
     ensure_folder_exists(error_folder, "error")
@@ -1288,7 +1289,7 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=str(e))
         raise
 
-    log.info("Getting inbox items matching filter...")
+    log.info("Phase A: getting inbox items matching filter for download only...")
     lookback_start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=EMAIL_LOOKBACK_DAYS)
     log.info("Filtering emails received after {ls} (lookback days: {ld})".format(ls=lookback_start, ld=EMAIL_LOOKBACK_DAYS))
     try:
@@ -1297,9 +1298,13 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
         items_count = items.count()
         log.info("Items found: {ic}".format(ic=items_count))
         if items_count > 0:
+            emails_with_excel = 0
+            excel_attachments = 0
+            attachment_index = 0
             for item in items:
                 received_ts = str(item.datetime_received)[:-6]
                 log.info("Message received timestamp: {rt} | subject: {subject}".format(rt=received_ts, subject=item.subject))
+                item_has_excel = False
                 for attachment in item.attachments:
                     if isinstance(attachment, FileAttachment):
                         attachment_size = getattr(attachment, "size", None)
@@ -1311,27 +1316,33 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
                         )
                         att_file_ext = os.path.splitext(attachment.name)[1].lstrip(".").lower()
                         if att_file_ext in ("xls", "xlsx"):
-                            local_path = os.path.join(SCRIPT_PATH, attachment.name)
+                            attachment_index += 1
+                            item_has_excel = True
+                            safe_original_name = os.path.basename(attachment.name)
+                            received_prefix = item.datetime_received.strftime("%Y%m%dT%H%M%S")
+                            local_filename = "{prefix}_{idx}_{name}".format(
+                                prefix=received_prefix,
+                                idx=str(attachment_index).zfill(3),
+                                name=safe_original_name,
+                            )
+                            local_path = os.path.join(SCRIPT_PATH, local_filename)
                             time.sleep(5)  ## Adding a 5 second delay for the file to finish being saved to see if this helps with file not found errors
                             with open(local_path, 'wb') as f:
                                 f.write(attachment.content)
                             log.info('Saved attachment to {lp}'.format(lp=local_path))
                             reference_dt = parse_reference_date_from_filename(attachment.name) or item.datetime_received
-                            log.info(
-                                "Processing returned file: {sn} reference_dt={rd}".format(
-                                    sn=attachment.name,
-                                    rd=reference_dt,
-                                )
-                            )
-                            get_cleaned_data_from_file(
-                                local_path,
-                                reference_dt=reference_dt,
-                                dry_run=dry_run,
-                                audit_only=audit_only,
-                                dryrun_backup_folder=dryrun_backup_folder,
-                            )
+                            downloaded_files.append((local_path, reference_dt, attachment.name, item.datetime_received))
+                            excel_attachments += 1
                         else:
                             log.info("Skipping non-Excel attachment: {an}".format(an=attachment.name))
+                if item_has_excel:
+                    emails_with_excel += 1
+            log.info(
+                "Downloaded {count} excel attachment(s) from {emails} email(s).".format(
+                    count=excel_attachments,
+                    emails=emails_with_excel,
+                )
+            )
         else:
             log.info("No emails found to process.")
     except Exception as e:
@@ -1340,6 +1351,25 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
             send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle="AUTH_FAILURE",
                                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=str(e))
         raise
+
+    if not downloaded_files:
+        log.info("Phase B: no downloaded files to process.")
+        return
+
+    for local_path, reference_dt, original_filename, email_received_dt in downloaded_files:
+        log.info(
+            "Phase B processing file: {sn} reference_dt={rd}".format(
+                sn=original_filename,
+                rd=reference_dt,
+            )
+        )
+        get_cleaned_data_from_file(
+            local_path,
+            reference_dt=reference_dt,
+            dry_run=dry_run,
+            audit_only=audit_only,
+            dryrun_backup_folder=dryrun_backup_folder,
+        )
 
 
 def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit_only=False, dryrun_backup_folder=None):
