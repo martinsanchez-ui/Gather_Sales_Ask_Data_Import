@@ -38,6 +38,7 @@ SCRIPT_PATH = sys.path[0] + os.sep
 LOG_LOCATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gsd_askdata_logs", "log.log")
 SEND_TEAMS_MESSAGE_SUMMARY = "Gather_Sales_Data_Ask_Data_Import"
 SEND_TEAMS_MESSAGE_ACTIVITY_TITLE = "Data Not Updated"
+EMAIL_LOOKBACK_DAYS = int(os.getenv("GSD_EMAIL_LOOKBACK_DAYS", "180"))
 
 SECRETS = load_secrets(ENV_FILE_PATH, values_required=["dbmaster_hostname", "dbmaster_username", "dbmaster_password", "dbmaster_database", "bi_hostname", "bi_username", 
                                                        "bi_password", "bi_database", "client_id", "client_secret", "tenant_id",  "primary_smtp_address", "outlook_server", 
@@ -172,6 +173,71 @@ def update_gsd_table(status_name, office_id):
         log.error("Update failed with MySQL error: {e}".format(e=e))
 
     update_cur.close()
+
+
+def parse_reference_date_from_filename(filename):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    basename = os.path.basename(filename)
+    match = re.search(r"gather_sales_data_(\d{8})", basename, re.IGNORECASE)
+    if match:
+        try:
+            return datetime.datetime.strptime(match.group(1), "%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
+def is_attachment_already_processed(df_or_office_ids, reference_dt, stats=None):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    if reference_dt is None:
+        return False
+
+    if hasattr(df_or_office_ids, "columns") and "office_id" in df_or_office_ids.columns:
+        office_ids = df_or_office_ids["office_id"].tolist()
+    else:
+        office_ids = df_or_office_ids
+
+    office_ids = [int(office_id) for office_id in office_ids if pd.notna(office_id)]
+    office_ids = sorted(set(office_ids))
+
+    if not office_ids:
+        return False
+
+    if reference_dt.tzinfo is not None:
+        reference_dt = reference_dt.replace(tzinfo=None)
+
+    office_id_list = ",".join(str(office_id) for office_id in office_ids)
+    lookup_sql = """
+        SELECT office_id, recieved_dtt
+        FROM bi_warehouse_prd.gather_sales_data_f
+        WHERE office_id IN ({office_id_list});
+    """
+
+    lookup_cur = bi.cursor()
+    lookup_cur.execute(lookup_sql.format(office_id_list=office_id_list))
+    rows = lookup_cur.fetchall()
+    lookup_cur.close()
+
+    recieved_by_office = {row[0]: row[1] for row in rows}
+
+    total_count = len(office_ids)
+    processed_count = 0
+
+    for office_id in office_ids:
+        recieved_dtt = recieved_by_office.get(office_id)
+        if recieved_dtt is not None and recieved_dtt >= reference_dt:
+            processed_count += 1
+
+    pending_count = total_count - processed_count
+
+    if stats is not None:
+        stats["total"] = total_count
+        stats["processed"] = processed_count
+        stats["pending"] = pending_count
+
+    return pending_count == 0
 
 
 def name_check(row):
@@ -1208,41 +1274,35 @@ def get_cleaned_data_from_email():
         log.info("Error folder already exists.")
 
     log.info("Getting inbox items matching filter...")
-    items = account.inbox.filter(is_read=False, subject="ReminderMedia: Gather Sales Data - AskData").order_by(
-        "datetime_received")
+    lookback_start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=EMAIL_LOOKBACK_DAYS)
+    log.info("Filtering emails received after {ls} (lookback days: {ld})".format(ls=lookback_start, ld=EMAIL_LOOKBACK_DAYS))
+    items = account.inbox.filter(subject="ReminderMedia: Gather Sales Data - AskData",
+                                 datetime_received__gte=lookback_start).order_by("datetime_received")
     if items.count() > 0:
         log.info("Items found: ".format(items.count()))
         for item in items:
             received_ts = str(item.datetime_received)[:-6]
             log.info("Message received timestamp: {rt}".format(rt=received_ts))
-            log.info("Marking email message as read...")
-            item.is_read = True
-            item.save()
-            log.info("Message marked as read.")
             for attachment in item.attachments:
                 if isinstance(attachment, FileAttachment):
                     log.info("Attachment found: {an} - Checking file attachement...".format(an=attachment.name))
-                    att_name = attachment.name.split(".")
-                    att_file_name = att_name[0]
-                    att_file_ext = att_name[1]
-                    if att_file_ext == "xls" or att_file_ext == "xlsx":
+                    att_file_ext = os.path.splitext(attachment.name)[1].lstrip(".").lower()
+                    if att_file_ext in ("xls", "xlsx"):
                         local_path = os.path.join(SCRIPT_PATH, attachment.name)
                         time.sleep(5)  ## Adding a 5 second delay for the file to finish being saved to see if this helps with file not found errors
                         with open(local_path, 'wb') as f:
                             f.write(attachment.content)
                         log.info('Saved attachment to {lp}'.format(lp=local_path))
                         log.info("Processing returned file: {sn}".format(sn=attachment.name))
-                        get_cleaned_data_from_file(local_path)
+                        reference_dt = parse_reference_date_from_filename(attachment.name) or item.datetime_received
+                        get_cleaned_data_from_file(local_path, reference_dt=reference_dt)
                     else:
-                        string = "Attachment type invalid!  Must be .xls or .xlsx!"
-                        log.error(string)
-                        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
-                                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=string)
+                        log.info("Skipping non-Excel attachment: {an}".format(an=attachment.name))
     else:
         log.info("No emails found to process.")
 
 
-def get_cleaned_data_from_file(filename):
+def get_cleaned_data_from_file(filename, reference_dt=None):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
 
     backup_folder = SCRIPT_PATH + "backup"
@@ -1311,6 +1371,40 @@ def get_cleaned_data_from_file(filename):
                     
                     log.critical("Alert message sent.")
                     raise IOError("Returned dataframe has a missing column, please verify the data!")
+
+            if reference_dt is None:
+                reference_dt = parse_reference_date_from_filename(filename)
+            if reference_dt is None:
+                reference_dt = datetime.datetime.now()
+
+            reference_stats = {}
+            already_processed = is_attachment_already_processed(returned_data_df, reference_dt, stats=reference_stats)
+            if already_processed:
+                log.info(
+                    "SKIP already processed based on recieved_dtt: {fn} reference_dt={rd} "
+                    "(office_ids total={tot}, processed={proc}, pending={pend})".format(
+                        fn=filename,
+                        rd=reference_dt,
+                        tot=reference_stats.get("total", 0),
+                        proc=reference_stats.get("processed", 0),
+                        pend=reference_stats.get("pending", 0),
+                    )
+                )
+                if os.path.exists(local_path):
+                    log.info("File found, moving to backup.")
+                    os.rename(local_path, backup_path)
+                return
+
+            log.info(
+                "PROCESS attachment: {fn} reference_dt={rd} "
+                "(office_ids total={tot}, processed={proc}, pending={pend})".format(
+                    fn=filename,
+                    rd=reference_dt,
+                    tot=reference_stats.get("total", 0),
+                    proc=reference_stats.get("processed", 0),
+                    pend=reference_stats.get("pending", 0),
+                )
+            )
 
             returned_data_df = returned_data_df.rename(
                 {"phone_number": "office_phone", "address": "line_1", "postal_code": "zip_code",
