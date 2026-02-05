@@ -1363,13 +1363,32 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
                 rd=reference_dt,
             )
         )
-        get_cleaned_data_from_file(
-            local_path,
-            reference_dt=reference_dt,
-            dry_run=dry_run,
-            audit_only=audit_only,
-            dryrun_backup_folder=dryrun_backup_folder,
-        )
+        try:
+            get_cleaned_data_from_file(
+                local_path,
+                reference_dt=reference_dt,
+                dry_run=dry_run,
+                audit_only=audit_only,
+                dryrun_backup_folder=dryrun_backup_folder,
+            )
+        except Exception as e:
+            log.error(
+                "Phase B failed for file {fn} at {lp}: {err}".format(
+                    fn=original_filename,
+                    lp=local_path,
+                    err=e,
+                )
+            )
+            send_teams_message(
+                summary=SEND_TEAMS_MESSAGE_SUMMARY,
+                activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
+                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                text="Phase B failed for file {fn} at {lp}: {err}".format(
+                    fn=original_filename,
+                    lp=local_path,
+                    err=e,
+                ),
+            )
 
 
 def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit_only=False, dryrun_backup_folder=None):
@@ -1397,7 +1416,7 @@ def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit
     if os.path.exists(source_path):
         log.info("File found, proceeding...")
         att_file_name, att_file_ext = os.path.splitext(base)
-        att_file_ext = att_file_ext.lstrip(".")
+        att_file_ext = att_file_ext.lstrip(".").lower()
         if att_file_ext == "xls" or att_file_ext == "xlsx":
             log.info("Processing file: {sn}".format(sn=source_path))
             log.info("Getting returned data...")
