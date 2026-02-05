@@ -1,8 +1,7 @@
-/backup
-/logs
-.DS_Store
-etl_scripts/CleanRosterImport/backup/*
-!etl_scripts/CleanRosterImport/backup/.gitkeep
-
-etl_scripts/CleanRosterImport/logs/*
-!etl_scripts/CleanRosterImport/logs/.gitkeep
+# Ignore any folder named "test" anywhere in the repo
+test/
+**/test/
+# Ignore all .log files
+*.log           
+# Ignore all .env files
+*.env
