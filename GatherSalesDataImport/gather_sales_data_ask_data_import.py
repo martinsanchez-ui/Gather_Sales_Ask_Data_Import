@@ -15,6 +15,7 @@ import sys
 import time
 import warnings
 from operator import itemgetter
+import argparse
 
 import MySQLdb as mysql
 import pandas as pd
@@ -39,6 +40,8 @@ LOG_LOCATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gsd_ask
 SEND_TEAMS_MESSAGE_SUMMARY = "Gather_Sales_Data_Ask_Data_Import"
 SEND_TEAMS_MESSAGE_ACTIVITY_TITLE = "Data Not Updated"
 EMAIL_LOOKBACK_DAYS = int(os.getenv("GSD_EMAIL_LOOKBACK_DAYS", "180"))
+GSD_DRY_RUN = os.getenv("GSD_DRY_RUN", "0") == "1"
+GSD_AUDIT_RUN = os.getenv("GSD_AUDIT_RUN", "0") == "1"
 
 SECRETS = load_secrets(ENV_FILE_PATH, values_required=["dbmaster_hostname", "dbmaster_username", "dbmaster_password", "dbmaster_database", "bi_hostname", "bi_username", 
                                                        "bi_password", "bi_database", "client_id", "client_secret", "tenant_id",  "primary_smtp_address", "outlook_server", 
@@ -61,6 +64,22 @@ if DB_LEVEL == "prod":
     log.info("Database connection open.")
 else:
     raise ValueError("Unknown db_level value!")
+
+
+def is_auth_failure(error):
+    error_text = str(error).lower()
+    auth_markers = ["aadsts", "refresh_token", "invalid_client", "invalid_grant", "oauth"]
+    return any(marker in error_text for marker in auth_markers)
+
+
+def ensure_folder_exists(folder_path, folder_label):
+    log.info("Checking for {fl} folder...".format(fl=folder_label))
+    if not os.path.exists(folder_path):
+        log.info("{fl} folder does not exist.  Creating...".format(fl=folder_label))
+        os.mkdir(folder_path)
+        log.info("{fl} folder: {tf} created.".format(fl=folder_label, tf=folder_path))
+    else:
+        log.info("{fl} folder already exists.".format(fl=folder_label))
 
 
 def update_companies_table(office_id, employee_count=0, phone_number=""):
@@ -1246,83 +1265,95 @@ def compare_and_update(df_dict):
         update_status(workflow_id=df_dict["case_id"], status_id=271)
         log.info('No changes found! Status changed to 271')
 
-def get_cleaned_data_from_email():
+def get_cleaned_data_from_email(dry_run=False, audit_only=False):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
-    
-    credentials = OAuth2Credentials(client_id=SECRETS.get("client_id"), client_secret=SECRETS.get("client_secret"), tenant_id=SECRETS.get("tenant_id"),
-                                    identity=Identity(primary_smtp_address=SECRETS.get("primary_smtp_address")))
-    config = Configuration(credentials=credentials, server=SECRETS.get("outlook_server"), version=Version(build=EXCHANGE_O365))
-    account = Account(primary_smtp_address=SECRETS.get("primary_smtp_address"), config=config, autodiscover=False, access_type=IMPERSONATION)
 
     backup_folder = SCRIPT_PATH + "backup"
     error_folder = SCRIPT_PATH + "error"
+    dryrun_backup_folder = SCRIPT_PATH + "dryrun_backup"
 
-    log.info("Checking for backup folder...")
-    if not os.path.exists(backup_folder):
-        log.info("Backup folder does not exist.  Creating...")
-        os.mkdir(backup_folder)
-        log.info("Backup folder: {tf} created.".format(tf=backup_folder))
-    else:
-        log.info("Backup folder already exists.")
+    ensure_folder_exists(backup_folder, "backup")
+    ensure_folder_exists(error_folder, "error")
+    if dry_run or audit_only:
+        ensure_folder_exists(dryrun_backup_folder, "dryrun_backup")
 
-    log.info("Checking for error folder...")
-    if not os.path.exists(error_folder):
-        log.info("Error folder does not exist.  Creating...")
-        os.mkdir(error_folder)
-        log.info("Error folder: {tf} created.".format(tf=error_folder))
-    else:
-        log.info("Error folder already exists.")
+    try:
+        credentials = OAuth2Credentials(client_id=SECRETS.get("client_id"), client_secret=SECRETS.get("client_secret"), tenant_id=SECRETS.get("tenant_id"),
+                                        identity=Identity(primary_smtp_address=SECRETS.get("primary_smtp_address")))
+        config = Configuration(credentials=credentials, server=SECRETS.get("outlook_server"), version=Version(build=EXCHANGE_O365))
+        account = Account(primary_smtp_address=SECRETS.get("primary_smtp_address"), config=config, autodiscover=False, access_type=IMPERSONATION)
+    except Exception as e:
+        log.error("AUTH_FAILURE: {err}".format(err=e))
+        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle="AUTH_FAILURE",
+                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=str(e))
+        raise
 
     log.info("Getting inbox items matching filter...")
     lookback_start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=EMAIL_LOOKBACK_DAYS)
     log.info("Filtering emails received after {ls} (lookback days: {ld})".format(ls=lookback_start, ld=EMAIL_LOOKBACK_DAYS))
-    items = account.inbox.filter(subject="ReminderMedia: Gather Sales Data - AskData",
-                                 datetime_received__gte=lookback_start).order_by("datetime_received")
-    if items.count() > 0:
-        log.info("Items found: ".format(items.count()))
-        for item in items:
-            received_ts = str(item.datetime_received)[:-6]
-            log.info("Message received timestamp: {rt}".format(rt=received_ts))
-            for attachment in item.attachments:
-                if isinstance(attachment, FileAttachment):
-                    log.info("Attachment found: {an} - Checking file attachement...".format(an=attachment.name))
-                    att_file_ext = os.path.splitext(attachment.name)[1].lstrip(".").lower()
-                    if att_file_ext in ("xls", "xlsx"):
-                        local_path = os.path.join(SCRIPT_PATH, attachment.name)
-                        time.sleep(5)  ## Adding a 5 second delay for the file to finish being saved to see if this helps with file not found errors
-                        with open(local_path, 'wb') as f:
-                            f.write(attachment.content)
-                        log.info('Saved attachment to {lp}'.format(lp=local_path))
-                        log.info("Processing returned file: {sn}".format(sn=attachment.name))
-                        reference_dt = parse_reference_date_from_filename(attachment.name) or item.datetime_received
-                        get_cleaned_data_from_file(local_path, reference_dt=reference_dt)
-                    else:
-                        log.info("Skipping non-Excel attachment: {an}".format(an=attachment.name))
-    else:
-        log.info("No emails found to process.")
+    try:
+        items = account.inbox.filter(subject="ReminderMedia: Gather Sales Data - AskData",
+                                     datetime_received__gte=lookback_start).order_by("datetime_received")
+        items_count = items.count()
+        log.info("Items found: {ic}".format(ic=items_count))
+        if items_count > 0:
+            for item in items:
+                received_ts = str(item.datetime_received)[:-6]
+                log.info("Message received timestamp: {rt} | subject: {subject}".format(rt=received_ts, subject=item.subject))
+                for attachment in item.attachments:
+                    if isinstance(attachment, FileAttachment):
+                        attachment_size = getattr(attachment, "size", None)
+                        log.info(
+                            "Attachment found: {an} (size={asize}) - Checking file attachment...".format(
+                                an=attachment.name,
+                                asize=attachment_size if attachment_size is not None else "unknown",
+                            )
+                        )
+                        att_file_ext = os.path.splitext(attachment.name)[1].lstrip(".").lower()
+                        if att_file_ext in ("xls", "xlsx"):
+                            local_path = os.path.join(SCRIPT_PATH, attachment.name)
+                            time.sleep(5)  ## Adding a 5 second delay for the file to finish being saved to see if this helps with file not found errors
+                            with open(local_path, 'wb') as f:
+                                f.write(attachment.content)
+                            log.info('Saved attachment to {lp}'.format(lp=local_path))
+                            reference_dt = parse_reference_date_from_filename(attachment.name) or item.datetime_received
+                            log.info(
+                                "Processing returned file: {sn} reference_dt={rd}".format(
+                                    sn=attachment.name,
+                                    rd=reference_dt,
+                                )
+                            )
+                            get_cleaned_data_from_file(
+                                local_path,
+                                reference_dt=reference_dt,
+                                dry_run=dry_run,
+                                audit_only=audit_only,
+                                dryrun_backup_folder=dryrun_backup_folder,
+                            )
+                        else:
+                            log.info("Skipping non-Excel attachment: {an}".format(an=attachment.name))
+        else:
+            log.info("No emails found to process.")
+    except Exception as e:
+        if is_auth_failure(e):
+            log.error("AUTH_FAILURE: {err}".format(err=e))
+            send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle="AUTH_FAILURE",
+                               activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=str(e))
+        raise
 
 
-def get_cleaned_data_from_file(filename, reference_dt=None):
+def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit_only=False, dryrun_backup_folder=None):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
 
     backup_folder = SCRIPT_PATH + "backup"
     error_folder = SCRIPT_PATH + "error"
+    if dryrun_backup_folder is None:
+        dryrun_backup_folder = SCRIPT_PATH + "dryrun_backup"
 
-    log.info("Checking for backup folder...")
-    if not os.path.exists(backup_folder):
-        log.info("Backup folder does not exist.  Creating...")
-        os.mkdir(backup_folder)
-        log.info("Backup folder: {tf} created.".format(tf=backup_folder))
-    else:
-        log.info("Backup folder already exists.")
-
-    log.info("Checking for error folder...")
-    if not os.path.exists(error_folder):
-        log.info("Error folder does not exist.  Creating...")
-        os.mkdir(error_folder)
-        log.info("Error folder: {tf} created.".format(tf=error_folder))
-    else:
-        log.info("Error folder already exists.")
+    ensure_folder_exists(backup_folder, "backup")
+    ensure_folder_exists(error_folder, "error")
+    if dry_run or audit_only:
+        ensure_folder_exists(dryrun_backup_folder, "dryrun_backup")
 
     source_path = filename
     base = os.path.basename(source_path)
@@ -1367,8 +1398,14 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                     log.critical("Moving returned file {sn} to error folder...".format(sn=filename))
                     log.critical("Rename source: {sp}".format(sp=source_path))
                     log.critical("Rename destination: {dp}".format(dp=error_path))
-                    os.rename(source_path, error_path)
-                    log.critical("Report file moved to error folder.")
+                    if dry_run or audit_only:
+                        log.critical("Dry run/audit mode: moving file to dryrun backup folder instead of error.")
+                        dryrun_error_path = os.path.join(dryrun_backup_folder, base)
+                        os.rename(source_path, dryrun_error_path)
+                        log.critical("Report file moved to dryrun backup folder.")
+                    else:
+                        os.rename(source_path, error_path)
+                        log.critical("Report file moved to error folder.")
                     log.critical("Sending teams message...")
                     send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
                                        activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
@@ -1386,8 +1423,9 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
             already_processed = is_attachment_already_processed(returned_data_df, reference_dt, stats=reference_stats)
             if already_processed:
                 log.info(
-                    "SKIP already processed based on recieved_dtt: {fn} reference_dt={rd} "
+                    "{mode} SKIP already processed based on recieved_dtt: {fn} reference_dt={rd} "
                     "(office_ids total={tot}, processed={proc}, pending={pend})".format(
+                        mode="AUDIT" if audit_only else "DRY RUN" if dry_run else "PROCESS",
                         fn=filename,
                         rd=reference_dt,
                         tot=reference_stats.get("total", 0),
@@ -1396,15 +1434,23 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                     )
                 )
                 if os.path.exists(source_path):
-                    log.info("File found, moving to backup.")
-                    log.info("Rename source: {sp}".format(sp=source_path))
-                    log.info("Rename destination: {dp}".format(dp=backup_path))
-                    os.rename(source_path, backup_path)
+                    if dry_run or audit_only:
+                        log.info("Dry run/audit mode: moving file to dryrun backup folder.")
+                        dryrun_path = os.path.join(dryrun_backup_folder, base)
+                        log.info("Rename source: {sp}".format(sp=source_path))
+                        log.info("Rename destination: {dp}".format(dp=dryrun_path))
+                        os.rename(source_path, dryrun_path)
+                    else:
+                        log.info("File found, moving to backup.")
+                        log.info("Rename source: {sp}".format(sp=source_path))
+                        log.info("Rename destination: {dp}".format(dp=backup_path))
+                        os.rename(source_path, backup_path)
                 return
 
             log.info(
-                "PROCESS attachment: {fn} reference_dt={rd} "
+                "{mode} attachment: {fn} reference_dt={rd} "
                 "(office_ids total={tot}, processed={proc}, pending={pend})".format(
+                    mode="AUDIT" if audit_only else "DRY RUN" if dry_run else "PROCESS",
                     fn=filename,
                     rd=reference_dt,
                     tot=reference_stats.get("total", 0),
@@ -1412,6 +1458,15 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
                     pend=reference_stats.get("pending", 0),
                 )
             )
+
+            if dry_run or audit_only:
+                if os.path.exists(source_path):
+                    log.info("Dry run/audit mode: moving file to dryrun backup folder.")
+                    dryrun_path = os.path.join(dryrun_backup_folder, base)
+                    log.info("Rename source: {sp}".format(sp=source_path))
+                    log.info("Rename destination: {dp}".format(dp=dryrun_path))
+                    os.rename(source_path, dryrun_path)
+                return
 
             returned_data_df = returned_data_df.rename(
                 {"phone_number": "office_phone", "address": "line_1", "postal_code": "zip_code",
@@ -1460,8 +1515,18 @@ def get_cleaned_data_from_file(filename, reference_dt=None):
 
 def main():
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+    parser = argparse.ArgumentParser(description="Gather Sales Data AskData Import")
+    parser.add_argument("--audit", action="store_true", help="Run audit-only pass with no updates.")
+    parser.add_argument("--dry-run", action="store_true", help="Run dry-run pass with no updates.")
+    args, _unknown = parser.parse_known_args()
+    dry_run = GSD_DRY_RUN or args.dry_run
+    audit_only = GSD_AUDIT_RUN or args.audit
     try:
-        get_cleaned_data_from_email()
+        log.info("Run mode: dry_run={dr} audit_only={au}".format(dr=dry_run, au=audit_only))
+        if audit_only and dry_run:
+            log.info("Both dry_run and audit_only enabled; audit_only will take precedence.")
+            dry_run = False
+        get_cleaned_data_from_email(dry_run=dry_run, audit_only=audit_only)
         ## For manual processing: 1) Comment out the line above and uncomment the line below and change the filename.  Don't forget to reverse these directions when finished!
         ## get_cleaned_data_from_file(filename="Set of Data 2000 April 4 to 8 2022.xlsx")
     except Exception as e:
