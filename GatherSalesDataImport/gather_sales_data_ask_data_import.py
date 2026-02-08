@@ -36,6 +36,7 @@ load_dotenv()
 DB_LEVEL = "prod"
 ENV_FILE_PATH = os.path.abspath('/datafiles/app_credentials.env')
 SCRIPT_PATH = sys.path[0] + os.sep
+DOWNLOAD_STAGING_FOLDER = os.path.join(SCRIPT_PATH, "files", "downloads")
 LOG_LOCATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gsd_askdata_logs", "log.log")
 SEND_TEAMS_MESSAGE_SUMMARY = "Gather_Sales_Data_Ask_Data_Import"
 SEND_TEAMS_MESSAGE_ACTIVITY_TITLE = "Data Not Updated"
@@ -76,10 +77,37 @@ def ensure_folder_exists(folder_path, folder_label):
     log.info("Checking for {fl} folder...".format(fl=folder_label))
     if not os.path.exists(folder_path):
         log.info("{fl} folder does not exist.  Creating...".format(fl=folder_label))
-        os.mkdir(folder_path)
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+        except OSError as e:
+            log.error("Failed to create {fl} folder {tf}: {e}".format(fl=folder_label, tf=folder_path, e=e))
+            raise
         log.info("{fl} folder: {tf} created.".format(fl=folder_label, tf=folder_path))
     else:
         log.info("{fl} folder already exists.".format(fl=folder_label))
+
+
+def resolve_file_path_with_fallback(local_path, staging_folder):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    if os.path.exists(local_path):
+        return local_path
+
+    base = os.path.basename(local_path)
+    fallback_folders = [
+        staging_folder,
+        os.path.join(SCRIPT_PATH, "files"),
+        os.path.join(SCRIPT_PATH, "backup"),
+        os.path.join(SCRIPT_PATH, "error"),
+        os.path.join(SCRIPT_PATH, "dryrun_backup"),
+    ]
+
+    for folder in fallback_folders:
+        candidate_path = os.path.join(folder, base)
+        if os.path.exists(candidate_path):
+            return candidate_path
+
+    return None
 
 
 def update_companies_table(office_id, employee_count=0, phone_number=""):
@@ -1271,10 +1299,12 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
     backup_folder = SCRIPT_PATH + "backup"
     error_folder = SCRIPT_PATH + "error"
     dryrun_backup_folder = SCRIPT_PATH + "dryrun_backup"
+    staging_folder = DOWNLOAD_STAGING_FOLDER
     downloaded_files = []
 
     ensure_folder_exists(backup_folder, "backup")
     ensure_folder_exists(error_folder, "error")
+    ensure_folder_exists(staging_folder, "download staging")
     if dry_run or audit_only:
         ensure_folder_exists(dryrun_backup_folder, "dryrun_backup")
 
@@ -1325,11 +1355,32 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
                                 idx=str(attachment_index).zfill(3),
                                 name=safe_original_name,
                             )
-                            local_path = os.path.join(SCRIPT_PATH, local_filename)
+                            local_path = os.path.join(staging_folder, local_filename)
                             time.sleep(5)  ## Adding a 5 second delay for the file to finish being saved to see if this helps with file not found errors
                             with open(local_path, 'wb') as f:
                                 f.write(attachment.content)
-                            log.info('Saved attachment to {lp}'.format(lp=local_path))
+                            if not os.path.exists(local_path):
+                                error = "Phase A download verification failed (missing file) for {fn} at {lp}".format(
+                                    fn=attachment.name,
+                                    lp=local_path,
+                                )
+                                log.error(error)
+                                send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
+                                                   activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=error)
+                                continue
+
+                            file_size = os.path.getsize(local_path)
+                            if file_size <= 0:
+                                error = "Phase A download verification failed (0-byte file) for {fn} at {lp}".format(
+                                    fn=attachment.name,
+                                    lp=local_path,
+                                )
+                                log.error(error)
+                                send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
+                                                   activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=error)
+                                continue
+
+                            log.info('Saved attachment to {lp} (size={sz} bytes)'.format(lp=local_path, sz=file_size))
                             reference_dt = parse_reference_date_from_filename(attachment.name) or item.datetime_received
                             downloaded_files.append((local_path, reference_dt, attachment.name, item.datetime_received))
                             excel_attachments += 1
@@ -1357,15 +1408,33 @@ def get_cleaned_data_from_email(dry_run=False, audit_only=False):
         return
 
     for local_path, reference_dt, original_filename, email_received_dt in downloaded_files:
+        resolved_path = local_path
+        if not os.path.exists(local_path):
+            log.error("Phase B could not find expected staging file at {lp}; attempting fallback lookup.".format(lp=local_path))
+            fallback_path = resolve_file_path_with_fallback(local_path, staging_folder)
+            if fallback_path is not None:
+                resolved_path = fallback_path
+                log.info("Phase B resolved file path via fallback: {rp}".format(rp=resolved_path))
+            else:
+                msg = "Phase B could not locate file {fn}. Expected path {lp}; file not found in staging/files/backup/error/dryrun_backup.".format(
+                    fn=original_filename,
+                    lp=local_path,
+                )
+                log.error(msg)
+                send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE,
+                                   activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=msg)
+                continue
+
         log.info(
-            "Phase B processing file: {sn} reference_dt={rd}".format(
+            "Phase B processing file: {sn} reference_dt={rd} resolved_path={rp}".format(
                 sn=original_filename,
                 rd=reference_dt,
+                rp=resolved_path,
             )
         )
         try:
             get_cleaned_data_from_file(
-                local_path,
+                resolved_path,
                 reference_dt=reference_dt,
                 dry_run=dry_run,
                 audit_only=audit_only,
@@ -1450,6 +1519,8 @@ def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit
                     if dry_run or audit_only:
                         log.critical("Dry run/audit mode: moving file to dryrun backup folder instead of error.")
                         dryrun_error_path = os.path.join(dryrun_backup_folder, base)
+                        log.critical("Rename source: {sp}".format(sp=source_path))
+                        log.critical("Rename destination: {dp}".format(dp=dryrun_error_path))
                         os.rename(source_path, dryrun_error_path)
                         log.critical("Report file moved to dryrun backup folder.")
                     else:
@@ -1489,11 +1560,13 @@ def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit
                         log.info("Rename source: {sp}".format(sp=source_path))
                         log.info("Rename destination: {dp}".format(dp=dryrun_path))
                         os.rename(source_path, dryrun_path)
+                        log.info("Report file moved to dryrun backup folder.")
                     else:
                         log.info("File found, moving to backup.")
                         log.info("Rename source: {sp}".format(sp=source_path))
                         log.info("Rename destination: {dp}".format(dp=backup_path))
                         os.rename(source_path, backup_path)
+                        log.info("Report file moved to backup folder.")
                 return
 
             log.info(
@@ -1515,6 +1588,7 @@ def get_cleaned_data_from_file(filename, reference_dt=None, dry_run=False, audit
                     log.info("Rename source: {sp}".format(sp=source_path))
                     log.info("Rename destination: {dp}".format(dp=dryrun_path))
                     os.rename(source_path, dryrun_path)
+                    log.info("Report file moved to dryrun backup folder.")
                 return
 
             returned_data_df = returned_data_df.rename(
@@ -1584,13 +1658,26 @@ def main():
                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=e)
     finally:
         processed_file_folder = "files"
+        processed_files_path = os.path.join(SCRIPT_PATH, processed_file_folder)
+        ensure_folder_exists(processed_files_path, "files")
+        staging_folder = DOWNLOAD_STAGING_FOLDER
         for file_name in os.listdir(SCRIPT_PATH):
-            if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
-                processed_file_path = os.path.join(SCRIPT_PATH, file_name)
-                new_file_path = os.path.join(SCRIPT_PATH, processed_file_folder, file_name)
-                if os.path.isfile(new_file_path):
-                    os.remove(new_file_path)
-                shutil.move(processed_file_path, new_file_path)
+            processed_file_path = os.path.join(SCRIPT_PATH, file_name)
+            if not os.path.isfile(processed_file_path):
+                continue
+
+            if not (file_name.endswith(".xlsx") or file_name.endswith(".xls")):
+                continue
+
+            if processed_file_path.startswith(staging_folder + os.sep) or processed_file_path.startswith(processed_files_path + os.sep):
+                log.info("Skipping cleanup sweep for managed folder file: {fp}".format(fp=processed_file_path))
+                continue
+
+            new_file_path = os.path.join(SCRIPT_PATH, processed_file_folder, file_name)
+            if os.path.isfile(new_file_path):
+                os.remove(new_file_path)
+            log.info("Cleanup sweep moving file from {sp} to {dp}".format(sp=processed_file_path, dp=new_file_path))
+            shutil.move(processed_file_path, new_file_path)
         log.info("Closing database connection...")
         bi.close()
         db.close()
